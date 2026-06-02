@@ -7,6 +7,8 @@ Hầu hết follower sẽ không có email — kết quả thường thưa.
 Tính năng:
     - tự động dùng Search API tìm top N user nhiều follower nhất (mặc định 100)
       mỗi lần chạy, rồi quét follower của tất cả họ; hoặc chỉ định --users
+    - lấy email qua GraphQL theo LÔ: gộp tới 50 user/1 request (nhanh hơn REST
+      gọi từng user hàng chục lần); tự fallback REST khi không có token
     - quét follower của nhiều owner trong cùng một lần chạy, gộp & dedup email
     - retry tự động khi timeout / lỗi mạng / 403 / 429 (exponential backoff)
     - lưu progress TỪNG BƯỚC (append mỗi profile vào file .jsonl)
@@ -42,11 +44,15 @@ from pathlib import Path
 from typing import Iterator, TextIO
 
 API_BASE = "https://api.github.com"
+GRAPHQL_URL = f"{API_BASE}/graphql"
 DEFAULT_OUTPUT = "github_follower_emails.txt"
 DEFAULT_PROGRESS = ".github_follower_emails_progress.jsonl"
 DEFAULT_AUTO_TOP = 100
 MAX_RETRIES = 6
 REQUEST_TIMEOUT = 60
+# Số login lấy email trong 1 request GraphQL (mỗi user là 1 alias).
+# GraphQL gộp nhiều user/1 request → nhanh hơn REST (1 request/user) hàng chục lần.
+GRAPHQL_BATCH_SIZE = 50
 
 
 def _headers(token: str | None) -> dict[str, str]:
@@ -218,6 +224,78 @@ def fetch_public_email(login: str, token: str | None) -> str | None:
     return None
 
 
+def _graphql_request(query: str, token: str) -> tuple[dict, dict[str, str]]:
+    """POST 1 query GraphQL, có retry giống _request (timeout/mạng/403/429)."""
+    payload = json.dumps({"query": query}).encode("utf-8")
+    headers = {**_headers(token), "Content-Type": "application/json"}
+    last_err: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        req = urllib.request.Request(
+            GRAPHQL_URL, data=payload, headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                body = resp.read().decode("utf-8")
+                hdrs = {k.lower(): v for k, v in resp.headers.items()}
+                return json.loads(body), hdrs
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code in (403, 429, 502, 503) and attempt < MAX_RETRIES:
+                wait = min(2**attempt, 90)
+                print(
+                    f"  GraphQL HTTP {exc.code}, retry {attempt}/{MAX_RETRIES} sau {wait}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                last_err = exc
+                continue
+            raise RuntimeError(f"GraphQL HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if attempt < MAX_RETRIES:
+                wait = min(2**attempt, 90)
+                print(
+                    f"  GraphQL lỗi mạng ({exc}), retry {attempt}/{MAX_RETRIES} sau {wait}s...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                last_err = exc
+                continue
+            raise RuntimeError(f"GraphQL request failed: {exc}") from exc
+    raise RuntimeError(f"GraphQL request failed: {last_err}")
+
+
+def fetch_emails_batch(logins: list[str], token: str) -> dict[str, str | None]:
+    """Lấy email công khai của NHIỀU login trong 1 request GraphQL (dùng alias).
+
+    Trả về dict {login: email|None}. Login lỗi/đã xóa sẽ là None thay vì làm
+    hỏng cả batch (GraphQL trả lỗi riêng cho từng alias, các alias khác vẫn có data).
+    """
+    if not logins:
+        return {}
+    alias_to_login: dict[str, str] = {}
+    parts: list[str] = []
+    for i, login in enumerate(logins):
+        alias = f"u{i}"
+        alias_to_login[alias] = login
+        # json.dumps để escape an toàn chuỗi login bên trong query.
+        parts.append(f"{alias}: user(login: {json.dumps(login)}) {{ login email }}")
+    query = "query {\n" + "\n".join(parts) + "\n}"
+
+    resp, hdrs = _graphql_request(query, token)
+    _wait_for_rate_limit(hdrs)
+
+    result: dict[str, str | None] = {login: None for login in logins}
+    data = resp.get("data") or {}
+    for alias, node in data.items():
+        login = alias_to_login.get(alias)
+        if login is None or not isinstance(node, dict):
+            continue
+        email = node.get("email")
+        if email and isinstance(email, str) and email.strip():
+            result[login] = email.strip()
+    return result
+
+
 def scan_owner(
     owner: str,
     token: str | None,
@@ -231,37 +309,59 @@ def scan_owner(
 ) -> bool:
     """Quét follower của 1 owner.
 
+    Gom follower thành lô GRAPHQL_BATCH_SIZE rồi lấy email mỗi lô bằng 1 request
+    GraphQL (nhanh hơn REST nhiều). Khi không có token, fallback gọi REST từng user.
+
     Trả về True nếu owner đã quét xong (hoặc đạt max_per_user) → có thể đánh dấu
     owner_done. Trả về False nếu dừng do đạt --limit toàn cục (chưa xong owner).
     """
     per_user = 0
+    batch: list[str] = []
+
+    def flush_batch() -> None:
+        """Lấy email cả lô, ghi progress + output cho từng login trong lô."""
+        if not batch:
+            return
+        if token:
+            emails_map = fetch_emails_batch(batch, token)
+        else:
+            # Không có token → GraphQL không dùng được, lùi về REST từng user.
+            emails_map = {lg: fetch_public_email(lg, token) for lg in batch}
+
+        new_email = False
+        for lg in batch:
+            email = emails_map.get(lg)
+            processed.add(lg)
+            append_progress(progress_handle, lg, email)
+            if email and email not in seen_emails:
+                seen_emails.add(email)
+                emails.append(email)
+                new_email = True
+                print(f"  [{len(processed)}] @{owner} ▸ {lg}: {email}", file=sys.stderr)
+
+        if new_email:
+            write_output(output_path, emails)
+        print(
+            f"  ... đã quét {len(processed)} profile, {len(emails)} email",
+            file=sys.stderr,
+        )
+        batch.clear()
+
     for login in iter_followers(owner, token):
-        if limit is not None and len(processed) >= limit:
-            return False
         if max_per_user is not None and per_user >= max_per_user:
             break  # đủ cho owner này
-
         if login in processed:
             continue
+        if limit is not None and (len(processed) + len(batch)) >= limit:
+            flush_batch()
+            return False
 
-        email = fetch_public_email(login, token)
-        processed.add(login)
+        batch.append(login)
         per_user += 1
+        if len(batch) >= GRAPHQL_BATCH_SIZE:
+            flush_batch()
 
-        append_progress(progress_handle, login, email)
-
-        if email and email not in seen_emails:
-            seen_emails.add(email)
-            emails.append(email)
-            write_output(output_path, emails)
-            print(f"  [{len(processed)}] @{owner} ▸ {login}: {email}", file=sys.stderr)
-        elif len(processed) % 100 == 0:
-            print(
-                f"  ... đã quét {len(processed)} profile, {len(emails)} email",
-                file=sys.stderr,
-            )
-        time.sleep(0.1)
-
+    flush_batch()
     return True
 
 

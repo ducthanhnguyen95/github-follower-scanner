@@ -4,11 +4,14 @@ Script `github_follower_emails.py` quét **follower của nhiều tài khoản G
 
 Mỗi lần chạy, script có thể **tự động dùng GitHub Search API** để tìm top N user nhiều follower nhất rồi quét follower của họ, hoặc bạn chỉ định danh sách user thủ công.
 
+Để quét nhanh hơn, script lấy email qua **GraphQL theo lô** — gộp tới 50 user trong **1 request** thay vì 1 request/user như REST, nhanh hơn hàng chục lần. Nếu không có token, script tự lùi về REST từng user.
+
 ---
 
 ## ⚠️ Lưu ý quan trọng
 
 - **GitHub ẩn email của hầu hết user.** Trường `email` chỉ trả về khi user **tự bật public** trên profile → kết quả thường **thưa** (phần lớn không có email).
+- **Lấy email dùng GraphQL (cần token).** GraphQL API **bắt buộc có token**; không có token script vẫn chạy nhưng lùi về REST từng user (chậm, 60 req/giờ).
 - **Quy mô top-follower rất lớn.** Top 100 user nhiều follower nhất có **100k–200k+ follower mỗi người**. Quét hết là **bất khả thi** trong thời gian ngắn (token GitHub giới hạn ~5.000 request/giờ). **Luôn dùng `--max-per-user` và/hoặc `--limit`.**
 - Chỉ thu thập **dữ liệu công khai**. Cân nhắc quyền riêng tư và điều khoản dịch vụ của GitHub trước khi dùng email cho mục đích liên hệ.
 
@@ -33,6 +36,7 @@ export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
 |----------|-------------|
 | ~5.000 request/giờ | chỉ **60** request/giờ |
 | Search: 30 req/phút | Search: 10 req/phút |
+| Email: GraphQL theo lô (50 user/request) | REST từng user (1 request/user) |
 
 ---
 
